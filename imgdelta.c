@@ -359,17 +359,17 @@ update_image_partial(const char *image_root, const char *dir_path)
 		trace3("%s vs %s", system_cursor.path, image_cursor.path);
 		r = strcmp(system_cursor.path, image_cursor.relative_path);
 		if (r == 0) {
-			ok = image_compare_copy(image_root, &system_cursor) || ok;
+			ok = image_compare_copy(image_root, &system_cursor) && ok;
 			system_cursor.d = NULL;
 			image_cursor.d = NULL;
 		} else
 		if (r < 0) {
 			trace("%s: added to system", system_cursor.path);
-			ok = image_copy(image_root, &system_cursor, NULL) || ok;
+			ok = image_copy(image_root, &system_cursor, NULL) && ok;
 			system_cursor.d = NULL;
 		} else {
 			trace("%s: removed from system", image_cursor.relative_path);
-			ok = image_remove(image_root, &image_cursor) || ok;
+			ok = image_remove(image_root, &image_cursor) && ok;
 			fsutil_ftw_skip(image_ctx, &image_cursor);
 			image_cursor.d = NULL;
 		}
@@ -377,16 +377,19 @@ update_image_partial(const char *image_root, const char *dir_path)
 
 	while (system_cursor.d) {
 		trace("%s: added to system", system_cursor.path);
-		ok = image_copy(image_root, &system_cursor, NULL) || ok;
+		ok = image_copy(image_root, &system_cursor, NULL) && ok;
 		fsutil_ftw_next(system_ctx, &system_cursor);
 	}
 
 	while (image_cursor.d) {
 		trace("%s: removed from system", image_cursor.path);
-		ok = image_remove(image_root, &image_cursor) || ok;
+		ok = image_remove(image_root, &image_cursor) && ok;
 		fsutil_ftw_skip(image_ctx, &image_cursor);
 		fsutil_ftw_next(image_ctx, &image_cursor);
 	}
+
+	if (!ok)
+		return 1;
 
 	return 0;
 }
