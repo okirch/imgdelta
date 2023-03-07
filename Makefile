@@ -31,7 +31,7 @@ install: $(IMGDELTA)
 	*) echo "DESTDIR is a relative path, no workie" >&2; exit 2;; \
 	esac
 	install -m 755 -d $(DESTDIR)$(BINDIR)
-	install -m 555 $(IMGDELTA) $(DESTDIR)$(BINDIR)
+	install -m 555 -s $(IMGDELTA) $(DESTDIR)$(BINDIR)
 ifneq ($(MAN1PAGES),)
 	install -m 755 -d $(DESTDIR)$(MAN1DIR)
 	install -m 444 $(MAN1PAGES) $(DESTDIR)$(MAN1DIR)
