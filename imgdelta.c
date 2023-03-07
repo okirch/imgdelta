@@ -343,10 +343,26 @@ update_image_partial(const char *image_root, const char *dir_path)
 	bool ok = true;
 
 	system_ctx = fsutil_ftw_open(dir_path, FSUTIL_FTW_SORTED, NULL);
-	image_ctx = fsutil_ftw_open(dir_path, FSUTIL_FTW_SORTED, image_root);
 
 	memset(&system_cursor, 0, sizeof(system_cursor));
 	memset(&image_cursor, 0, sizeof(image_cursor));
+
+	/* This is a hack - we need it until fsutil_ftw returns the top-level
+	 * directory as well. */
+	{
+		struct fsutil_ftw_cursor root_cursor;
+		struct dirent dirent;
+
+		strcpy(dirent.d_name, dir_path);
+		dirent.d_type = DT_DIR;
+
+		root_cursor.d = &dirent;
+		root_cursor.relative_path = root_cursor.path;
+		strcpy(root_cursor.path, dir_path);
+		ok = image_copy(image_root, &root_cursor, NULL);
+	}
+
+	image_ctx = fsutil_ftw_open(dir_path, FSUTIL_FTW_SORTED, image_root);
 
 	while (true) {
 		int r;
