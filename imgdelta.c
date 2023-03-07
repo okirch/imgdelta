@@ -220,6 +220,7 @@ image_copy(const char *image_root, struct fsutil_ftw_cursor *cursor, const struc
 
 	image_path = __concat_path(image_root, cursor->relative_path);
 	if (d->d_type == DT_DIR) {
+		trace2("mkdir(%s)", image_path);
 		if (mkdir(image_path, st->st_mode) < 0 && errno != EEXIST) {
 			log_error("%s: cannot create directory %m", image_path);
 			return false;
@@ -241,7 +242,7 @@ image_copy(const char *image_root, struct fsutil_ftw_cursor *cursor, const struc
 		target[len] = '\0';
 
 		(void) unlink(image_path);
-		trace("%s -> %s", image_path, target);
+		trace2("%s -> %s", image_path, target);
 		if (symlink(target, image_path) < 0) {
 			log_error("%s: unable to create symlink to: %m", cursor->path, target);
 			return false;
@@ -266,7 +267,7 @@ image_compare_copy(const char *image_root, struct fsutil_ftw_cursor *cursor)
 	image_path = __concat_path(image_root, cursor->path);
 	if (do_stat(image_path, &image_stb)
 	 && !__attrs_changed(cursor->path, &system_stb, &image_stb)) {
-		trace2("%s: unchanged", cursor->path);
+		trace3("%s: unchanged", cursor->path);
 		return true;
 	}
 
@@ -476,7 +477,6 @@ update_image(const char *image_root, const char *delta_path)
 
 	rv = update_image_work(image_root, fsutil_tempdir_path(&tempdir), dirs_to_update, delta_path);
 
-	fsutil_tempdir_unmount(&tempdir);
 	fsutil_tempdir_cleanup(&tempdir);
 	return rv;
 }
