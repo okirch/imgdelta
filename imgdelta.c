@@ -1,0 +1,528 @@
+/*
+ * wormhole
+ *
+ *   Copyright (C) 2023 Olaf Kirch <okir@suse.de>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ */
+
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <string.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <assert.h>
+
+#include "tracing.h"
+#include "util.h"
+
+static bool	can_chown = false;
+
+bool
+__mount_bind(const char *src, const char *dst, int extra_flags)
+{
+	trace("Binding %s to %s\n", src, dst);
+	if (mount(src, dst, NULL, MS_BIND | extra_flags, NULL) < 0) {
+		log_error("Unable to bind mount %s on %s: %m\n", src, dst);
+		return false;
+	}
+	return true;
+}
+
+static const char *
+__concat_path(const char *parent, const char *name)
+{
+	static char path[PATH_MAX];
+
+	if (!strcmp(parent, "/"))
+		parent = "";
+
+	while (*name == '/')
+		++name;
+	snprintf(path, sizeof(path), "%s/%s", parent, name);
+	return path;
+}
+
+static const struct stat *
+do_stat(const char *path, struct stat *stb)
+{
+	if (lstat(path, stb) < 0) {
+		log_error("%s: cannot stat: %m", path);
+		return NULL;
+	}
+
+	return stb;
+}
+
+static inline bool
+__attrs_changed(const char *path, const struct stat *sta, const struct stat *stb)
+{
+	bool changed = false;
+
+	if (sta->st_mode != stb->st_mode) {
+		trace("%s: mode changed 0%o -> 0%o", path, sta->st_mode, stb->st_mode);
+		changed = true;
+	}
+	if (!S_ISDIR(stb->st_mode) && sta->st_size != stb->st_size) {
+		trace("%s: size changed %lu -> %lu", path, (long) sta->st_size, (long) stb->st_size);
+		changed = true;
+	}
+
+	if (sta->st_mtim.tv_sec != stb->st_mtim.tv_sec
+	 || sta->st_mtim.tv_nsec / 1000 != stb->st_mtim.tv_nsec / 1000) {
+		trace("%s: mtime changed %lu.%09lu -> %lu.%09lu", path,
+				(long) sta->st_mtim.tv_sec,
+				(long) sta->st_mtim.tv_nsec,
+				(long) stb->st_mtim.tv_sec,
+				(long) stb->st_mtim.tv_nsec);
+		changed = true;
+	}
+
+	if (can_chown
+	 && sta->st_uid != stb->st_uid
+	 && sta->st_gid != stb->st_gid) {
+		trace("%s: owner changed from %u:%u -> %u:%u", path,
+				(int) sta->st_uid,
+				(int) sta->st_gid,
+				(int) stb->st_uid,
+				(int) stb->st_gid);
+		changed = true;
+	}
+
+	return changed;
+}
+
+static bool
+__image_update_attrs(const char *image_path, const struct stat *stb)
+{
+	const char *dir_path, *base_name;
+	int dirfd;
+
+	dir_path = pathutil_dirname(image_path);
+	base_name = basename(image_path);
+	if ((dirfd = open(dir_path, O_RDONLY|O_NOCTTY|O_NONBLOCK|O_NOFOLLOW|O_DIRECTORY)) < 0) {
+		log_error("unable to open %s: %m", dir_path);
+		return false;
+	}
+
+	if (can_chown && fchownat(dirfd, base_name, stb->st_uid, stb->st_gid, AT_SYMLINK_NOFOLLOW) < 0) {
+		log_error("%s: cannot set owner %u:%u: %m", image_path, stb->st_uid, stb->st_gid);
+		return false;
+	}
+
+	/* As of this writing, fchmodat does not support AT_SYMLINK_NOFOLLOW.
+	 * Hence we only make an attempt to change the mode for files other than symlinks */
+	if (!S_ISLNK(stb->st_mode)) {
+		if (fchmodat(dirfd, base_name, stb->st_mode & 0777, 0) < 0)
+			log_warning("%s: cannot set mode 0%03o: %m", image_path, stb->st_mode & 0777);
+	}
+
+	if (1) {
+		struct timespec ut[2];
+
+		ut[0] = stb->st_atim;
+		ut[1] = stb->st_mtim;
+
+		trace2("%s: changing mtime -> %lu.%09lu", image_path,
+				(long) ut[1].tv_sec,
+				(long) ut[1].tv_nsec);
+		if (utimensat(dirfd, base_name, ut, AT_SYMLINK_NOFOLLOW) < 0)
+			log_warning("%s: cannot set atime and mtime: %m", image_path);
+	}
+
+	/* copy SELinux context? */
+
+	close(dirfd);
+	return true;
+}
+
+static bool
+copy_file(const char *system_path, const char *image_path, const struct stat *st)
+{
+	char buffer[65536];
+	unsigned long copied = 0;
+	int srcfd = -1, dstfd = -1;
+	int rcount;
+	bool ok = false;
+
+	srcfd = open(system_path, O_RDONLY);
+	if (srcfd < 0) {
+		log_error("%s: unable to open file: %m", system_path);
+		return false;
+	}
+
+	unlink(image_path);
+
+	dstfd = open(image_path, O_CREAT | O_WRONLY | O_TRUNC, st->st_mode & 0777);
+	if (dstfd < 0) {
+		log_error("%s: unable to create file: %m", image_path);
+		close(srcfd);
+		return false;
+	}
+
+	while ((rcount = read(srcfd, buffer, sizeof(buffer))) > 0) {
+		int written = 0, wcount;
+
+		while (written < rcount) {
+			wcount = write(dstfd, buffer + written, rcount - written);
+			if (wcount < 0) {
+				log_error("%s: write error: %m", image_path);
+				goto failed;
+			}
+
+			written += wcount;
+		}
+
+		copied += rcount;
+	}
+
+	trace("%s: copied %lu bytes", image_path, copied);
+	ok = true;
+
+failed:
+	if (srcfd >= 0)
+		close(srcfd);
+	if (dstfd >= 0)
+		close(dstfd);
+	return ok;
+}
+
+static bool
+image_copy(const char *image_root, struct fsutil_ftw_cursor *cursor, const struct stat *st)
+{
+	const char *image_path;
+	const struct dirent *d = cursor->d;
+	struct stat _stb;
+
+	trace("copy %s -> %s%s", cursor->path, image_root, cursor->relative_path);
+	if (st == NULL && !(st = do_stat(cursor->path, &_stb)))
+		return false;
+
+	image_path = __concat_path(image_root, cursor->relative_path);
+	if (d->d_type == DT_DIR) {
+		if (mkdir(image_path, st->st_mode) < 0 && errno != EEXIST) {
+			log_error("%s: cannot create directory %m", image_path);
+			return false;
+		}
+	} else
+	if (d->d_type == DT_REG) {
+		if (!copy_file(cursor->path, image_path, st))
+			return false;
+	} else
+	if (d->d_type == DT_LNK) {
+		char target[PATH_MAX + 1];
+		ssize_t len;
+
+		len = readlink(cursor->path, target, sizeof(target) - 1);
+		if (len < 0) {
+			log_error("%s: readlink failed: %m", cursor->path);
+			return false;
+		}
+		target[len] = '\0';
+
+		(void) unlink(image_path);
+		trace("%s -> %s", image_path, target);
+		if (symlink(target, image_path) < 0) {
+			log_error("%s: unable to create symlink to: %m", cursor->path, target);
+			return false;
+		}
+	} else {
+		log_error("dirent type %u not yet implemented", d->d_type);
+		return false;
+	}
+
+	return __image_update_attrs(image_path, st);
+}
+
+static bool
+image_compare_copy(const char *image_root, struct fsutil_ftw_cursor *cursor)
+{
+	const char *image_path;
+	struct stat system_stb, image_stb;
+
+	if (!do_stat(cursor->path, &system_stb))
+		return false;
+
+	image_path = __concat_path(image_root, cursor->path);
+	if (do_stat(image_path, &image_stb)
+	 && !__attrs_changed(cursor->path, &system_stb, &image_stb)) {
+		trace2("%s: unchanged", cursor->path);
+		return true;
+	}
+
+	trace("%s: needs an update", cursor->path);
+	return image_copy(image_root, cursor, &system_stb);
+}
+
+static bool
+image_remove(const char *image_root, struct fsutil_ftw_cursor *cursor)
+{
+	const char *image_path = cursor->path;
+	struct stat stb;
+
+	trace("%s(%s)", __func__, image_path);
+	if (!do_stat(image_path, &stb))
+		return false;
+
+	switch (stb.st_mode & S_IFMT) {
+	case S_IFREG:
+	case S_IFLNK:
+	case S_IFCHR:
+	case S_IFBLK:
+	case S_IFSOCK:
+		if (unlink(image_path) < 0) {
+			log_error("%s: unlink failed: %m", image_path);
+			return false;
+		}
+		break;
+
+	case S_IFDIR:
+		if (!fsutil_remove_recursively(image_path))
+			return false;
+		break;
+
+	default:
+		log_error("%s: file type not supported", image_path);
+		return false;
+	}
+
+	return true;
+}
+
+bool
+copy_recursively(const char *src_path, const char *dst_path)
+{
+        struct fsutil_ftw_ctx *ctx;
+        struct fsutil_ftw_cursor cursor;
+	bool ok = true;
+
+        ctx = fsutil_ftw_open("/", 0, src_path);
+	if (mkdir(dst_path, 0755) < 0 && errno != EEXIST) {
+		log_error("%s: cannot create directory: %m", dst_path);
+		return false;
+	}
+
+        while (fsutil_ftw_next(ctx, &cursor)) {
+		char dst[PATH_MAX];
+
+		snprintf(dst, sizeof(dst), "%s/%s", dst_path, cursor.relative_path);
+		ok = image_copy(dst_path, &cursor, NULL) && ok;
+        }
+
+	fsutil_ftw_ctx_free(ctx);
+	return ok;
+}
+
+static int
+update_image_partial(const char *image_root, const char *dir_path)
+{
+	struct fsutil_ftw_ctx *system_ctx;
+	struct fsutil_ftw_ctx *image_ctx;
+	struct fsutil_ftw_cursor system_cursor;
+	struct fsutil_ftw_cursor image_cursor;
+	bool ok = true;
+
+	system_ctx = fsutil_ftw_open(dir_path, FSUTIL_FTW_SORTED, NULL);
+	image_ctx = fsutil_ftw_open(dir_path, FSUTIL_FTW_SORTED, image_root);
+
+	memset(&system_cursor, 0, sizeof(system_cursor));
+	memset(&image_cursor, 0, sizeof(image_cursor));
+
+	while (true) {
+		int r;
+
+		if (!system_cursor.d && !fsutil_ftw_next(system_ctx, &system_cursor))
+			break;
+		if (!image_cursor.d && !fsutil_ftw_next(image_ctx, &image_cursor))
+			break;
+
+		trace3("%s vs %s", system_cursor.path, image_cursor.path);
+		r = strcmp(system_cursor.path, image_cursor.relative_path);
+		if (r == 0) {
+			ok = image_compare_copy(image_root, &system_cursor) || ok;
+			system_cursor.d = NULL;
+			image_cursor.d = NULL;
+		} else
+		if (r < 0) {
+			trace("%s: added to system", system_cursor.path);
+			ok = image_copy(image_root, &system_cursor, NULL) || ok;
+			system_cursor.d = NULL;
+		} else {
+			trace("%s: removed from system", image_cursor.relative_path);
+			ok = image_remove(image_root, &image_cursor) || ok;
+			fsutil_ftw_skip(image_ctx, &image_cursor);
+			image_cursor.d = NULL;
+		}
+	}
+
+	while (system_cursor.d) {
+		trace("%s: added to system", system_cursor.path);
+		ok = image_copy(image_root, &system_cursor, NULL) || ok;
+		fsutil_ftw_next(system_ctx, &system_cursor);
+	}
+
+	while (image_cursor.d) {
+		trace("%s: removed from system", image_cursor.path);
+		ok = image_remove(image_root, &image_cursor) || ok;
+		fsutil_ftw_skip(image_ctx, &image_cursor);
+		fsutil_ftw_next(image_ctx, &image_cursor);
+	}
+
+	return 0;
+}
+
+static int
+update_image_work(const char *image_root, const char *tpath, const char **dirs_to_update, const char *delta_path)
+{
+	char upperdir[PATH_MAX], workdir[PATH_MAX], overlay[PATH_MAX];
+	const char *dir_path;
+
+	snprintf(workdir, sizeof(workdir), "%s/work", tpath);
+	if (mkdir(workdir, 0755) < 0) {
+		log_error("canot create work directory: %m");
+		return 1;
+	}
+
+	snprintf(upperdir, sizeof(upperdir), "%s/delta", tpath);
+	if (mkdir(upperdir, 0755) < 0) {
+		log_error("canot create delta directory: %m");
+		return 1;
+	}
+
+	snprintf(overlay, sizeof(overlay), "%s/root", tpath);
+	if (mkdir(overlay, 0755) < 0) {
+		log_error("canot create root directory: %m");
+		return 1;
+	}
+
+	if (!fsutil_mount_overlay(image_root, upperdir, workdir, image_root))
+		return 1;
+
+	trace("=== Building image delta between system and %s ===", image_root);
+	while ((dir_path = *dirs_to_update++) != NULL) {
+		int rv;
+
+		rv = update_image_partial(image_root, dir_path);
+		if (rv != 0)
+			return rv;
+	}
+
+	trace("=== Recursively copying image delta to %s ===", delta_path);
+	if (!copy_recursively(upperdir, delta_path))
+		return 1;
+
+	return 0;
+}
+
+static int
+update_image(const char *image_root, const char *delta_path)
+{
+	static const char *dirs_to_update[] = {
+		"/lib64",
+		NULL
+	};
+	struct fsutil_tempdir tempdir;
+	int rv;
+
+	fsutil_tempdir_init(&tempdir);
+
+	if (!wormhole_create_user_namespace(true))
+		return 1;
+
+        if (!fsutil_make_fs_private("/", false))
+                return 1;
+
+	if (!fsutil_tempdir_mount(&tempdir))
+		return 1;
+
+	rv = update_image_work(image_root, fsutil_tempdir_path(&tempdir), dirs_to_update, delta_path);
+
+	fsutil_tempdir_unmount(&tempdir);
+	fsutil_tempdir_cleanup(&tempdir);
+	return rv;
+}
+
+static struct option	long_options[] = {
+	{ "debug",	no_argument,		NULL,	'd'		},
+
+	{ NULL },
+};
+
+int
+main(int argc, char **argv)
+{
+	unsigned int opt_debug = 0;
+	char *image_root, *delta_path;
+	bool opt_force = false;
+	int c;
+
+	while ((c = getopt_long(argc, argv, "df", long_options, NULL)) != EOF) {
+		switch (c) {
+		case 'd':
+			opt_debug += 1;
+			break;
+
+		case 'f':
+			opt_force = true;
+			break;
+
+		default:
+			log_error("Unknown option\n");
+			return 1;
+		}
+	}
+
+	tracing_set_level(opt_debug);
+	trace("tracing set to %u", opt_debug);
+
+	if (optind + 2 != argc) {
+		log_error("Expecting two arguments: image-root delta-dir");
+		return 1;
+	}
+	image_root = argv[optind++];
+	delta_path = argv[optind++];
+
+	if (fsutil_exists(delta_path)) {
+		if (!opt_force) {
+			log_error("%s already exists, timidly bailing out", delta_path);
+			return 1;
+		}
+		if (!fsutil_remove_recursively(delta_path))
+			return 1;
+	}
+
+	/* strip off trailing slashes */
+	{
+		int len = strlen(image_root);
+
+		while (len && image_root[len-1] == '/')
+			image_root[--len] = '\0';
+	}
+
+	/* should check for CAP_CHOWN */
+	if (geteuid() == 0)
+		can_chown = true;
+
+	/* Traverse the entire filesystem and modify the image accordingly. */
+	return update_image(image_root, delta_path);
+}
