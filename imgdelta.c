@@ -473,8 +473,13 @@ update_image(struct imgdelta_config *cfg)
 	fsutil_tempdir_init(&tempdir);
 
 	trace("=== Initialiting namespace ===");
-	if (!wormhole_create_user_namespace(true))
-		return 1;
+	if (geteuid() == 0) {
+		if (!wormhole_create_namespace())
+			return 1;
+	} else {
+		if (!wormhole_create_user_namespace(true))
+			return 1;
+	}
 
         if (!fsutil_make_fs_private("/", false))
                 return 1;
