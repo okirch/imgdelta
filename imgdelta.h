@@ -27,9 +27,12 @@
 struct imgdelta_config {
 	unsigned int		debug;
 	bool			force;
+	bool			create_base_layer;
 
 	char *			image_root;
 	char *			layer_root;
+
+	struct strutil_array	layers_used;
 
 	struct strutil_array	copydirs;
 	struct strutil_array	excldirs;

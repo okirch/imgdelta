@@ -403,7 +403,7 @@ update_image_partial(const char *image_root, const char *dir_path, const struct 
 			goto done;
 	}
 
-	system_ctx = fsutil_ftw_open(dir_path, FSUTIL_FTW_SORTED, NULL);
+	system_ctx = fsutil_ftw_open(dir_path, FSUTIL_FTW_SORTED | FSUTIL_FTW_NEED_STAT, NULL);
 	if (system_ctx == NULL) {
 		log_error("Cannot open %s", dir_path);
 		return false;
@@ -476,8 +476,22 @@ static int
 update_image_work(struct imgdelta_config *cfg, const char *tpath)
 {
 	char upperdir[PATH_MAX], workdir[PATH_MAX], overlay[PATH_MAX];
+	char *lowerspec;
 	const char *image_root = cfg->image_root;
 	unsigned int i;
+	int rv;
+
+	if (cfg->create_base_layer) {
+		char empty[PATH_MAX];
+
+		/* should have been checked in main() */
+		assert(cfg->layers_used.count == 0);
+
+		snprintf(empty, sizeof(empty), "%s/empty", tpath);
+		strutil_array_append(&cfg->layers_used, empty);
+	}
+
+	lowerspec = strutil_array_join(&cfg->layers_used, ":");
 
 	snprintf(workdir, sizeof(workdir), "%s/work", tpath);
 	if (mkdir(workdir, 0755) < 0) {
@@ -497,7 +511,7 @@ update_image_work(struct imgdelta_config *cfg, const char *tpath)
 		return 1;
 	}
 
-	if (!fsutil_mount_overlay(image_root, upperdir, workdir, image_root))
+	if (!fsutil_mount_overlay(lowerspec, upperdir, workdir, image_root))
 		return 1;
 
 	trace("=== Building image delta between system and %s ===", image_root);
@@ -546,9 +560,12 @@ update_image(struct imgdelta_config *cfg)
 }
 
 static struct option	long_options[] = {
+	{ "create-base-layer",
+			no_argument,		NULL,	'B'		},
 	{ "config",	required_argument,	NULL,	'c'		},
 	{ "copy",	required_argument,	NULL,	'C'		},
 	{ "exclude",	required_argument,	NULL,	'X'		},
+	{ "use-layer",	required_argument,	NULL,	'L'		},
 	{ "force",	no_argument,		NULL,	'f'		},
 	{ "debug",	no_argument,		NULL,	'd'		},
 
@@ -561,14 +578,22 @@ main(int argc, char **argv)
 	struct imgdelta_config config = { 0 };
 	int c;
 
-	while ((c = getopt_long(argc, argv, "C:X:c:df", long_options, NULL)) != EOF) {
+	while ((c = getopt_long(argc, argv, "BC:L:X:c:df", long_options, NULL)) != EOF) {
 		switch (c) {
+		case 'B':
+			config.create_base_layer = true;
+			break;
+
 		case 'c':
 			log_error("Option --config not yet implemented");
 			return 1;
 
 		case 'C':
 			strutil_array_append(&config.copydirs, optarg);
+			break;
+
+		case 'L':
+			strutil_array_append(&config.layers_used, optarg);
 			break;
 
 		case 'X':
@@ -592,11 +617,10 @@ main(int argc, char **argv)
 	tracing_set_level(config.debug);
 	trace("tracing set to %u", config.debug);
 
-	if (optind + 2 != argc) {
-		log_error("Expecting two arguments: image-root delta-dir");
+	if (optind + 1 != argc) {
+		log_error("Expecting exactly one argument: output-layer");
 		return 1;
 	}
-	config.image_root = pathutil_sanitize(argv[optind++]);
 	config.layer_root = pathutil_sanitize(argv[optind++]);
 
 	if (config.copydirs.count == 0) {
@@ -610,8 +634,13 @@ main(int argc, char **argv)
 		unsigned int i;
 
 		trace("=== Configuration ===");
-		trace("Image root:  %s", config.image_root);
-		trace("Layer root:  %s", config.layer_root);
+		trace("Output layer: %s", config.layer_root);
+		trace("Layers used:  %s", config.layer_root);
+		if (config.create_base_layer)
+			trace("  (creating base layer)");
+		else
+			for (i = 0; i < config.layers_used.count; ++i)
+				trace("  %s", config.layers_used.data[i]);
 		trace("Dirs to copy");
 		for (i = 0; i < config.copydirs.count; ++i)
 			trace("  %s", config.copydirs.data[i]);
@@ -619,6 +648,15 @@ main(int argc, char **argv)
 			trace("Excluded");
 		for (i = 0; i < config.excldirs.count; ++i)
 			trace("  %s", config.excldirs.data[i]);
+	}
+
+	if (config.layers_used.count == 0 && !config.create_base_layer) {
+		log_error("No lower layers specified (if you want to create a base layer, explicitly usr --create-base-layer)");
+		return 1;
+	}
+	if (config.layers_used.count != 0 && config.create_base_layer) {
+		log_error("You want me to create a base layer, but specified lower layers");
+		return 1;
 	}
 
 	if (fsutil_exists(config.layer_root)) {
