@@ -374,12 +374,13 @@ copy_recursively(const char *src_path, const char *dst_path)
 }
 
 static int
-update_image_partial(const char *image_root, const char *dir_path)
+update_image_partial(const char *image_root, const char *dir_path, const struct strutil_array *exclude)
 {
 	struct fsutil_ftw_ctx *system_ctx;
 	struct fsutil_ftw_ctx *image_ctx;
 	struct fsutil_ftw_cursor system_cursor;
 	struct fsutil_ftw_cursor image_cursor;
+	unsigned int i;
 	bool ok = true;
 
 	/* This is a hack - we need it until fsutil_ftw returns the top-level
@@ -387,6 +388,9 @@ update_image_partial(const char *image_root, const char *dir_path)
 	{
 		struct stat stb;
 		int dt_type;
+
+		if (strutil_array_contains(exclude, dir_path))
+			goto done;
 
 		if (!do_stat(dir_path, &stb))
 			goto failed;
@@ -404,6 +408,9 @@ update_image_partial(const char *image_root, const char *dir_path)
 		log_error("Cannot open %s", dir_path);
 		return false;
 	}
+
+	for (i = 0; i < exclude->count; ++i)
+		fsutil_ftw_exclude(system_ctx, exclude->data[i]);
 
 	memset(&system_cursor, 0, sizeof(system_cursor));
 	memset(&image_cursor, 0, sizeof(image_cursor));
@@ -496,9 +503,8 @@ update_image_work(struct imgdelta_config *cfg, const char *tpath)
 	trace("=== Building image delta between system and %s ===", image_root);
 	for (i = 0; i < cfg->copydirs.count; ++i) {
 		const char *dir_path = cfg->copydirs.data[i];
-		int rv;
 
-		rv = update_image_partial(image_root, dir_path);
+		rv = update_image_partial(image_root, dir_path, &cfg->excldirs);
 		if (rv != 0)
 			return rv;
 	}

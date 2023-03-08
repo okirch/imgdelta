@@ -39,6 +39,14 @@
 #include "tracing.h"
 #include "util.h"
 
+struct dev_ino_array {
+	unsigned int		count;
+	struct {
+		dev_t		dev;
+		ino_t		ino;
+	} *data;
+};
+
 
 const char *
 procutil_concat_argv(int argc, char **argv)
@@ -740,6 +748,42 @@ fsutil_dir_is_empty(const char *path)
 	return empty;
 }
 
+/*
+ * Array of dev/inode number
+ */
+void
+dev_ino_array_append(struct dev_ino_array *a, dev_t dev, ino_t ino)
+{
+	if ((a->count % 64) == 0)
+		a->data = realloc(a->data, (a->count + 64) * sizeof(a->data[0]));
+	trace("%s: %lu %lu", __func__, (long) dev, (long) ino);
+	a->data[a->count].dev = dev;
+	a->data[a->count].ino = ino;
+	a->count++;
+}
+
+void
+dev_ino_array_destroy(struct dev_ino_array *a)
+{
+	if (a->data)
+		free(a->data);
+	memset(a, 0, sizeof(*a));
+	free(a);
+}
+
+bool
+dev_ino_array_contains(const struct dev_ino_array *a, dev_t dev, ino_t ino)
+{
+	unsigned int i;
+
+	for (i = 0; i < a->count; ++i) {
+		if (a->data[i].dev == dev && a->data[i].ino == ino)
+			return true;
+	}
+	return false;
+}
+
+
 typedef int	__fsutil_ftw_internal_cb_fn_t(const char *dir_path, int dir_fd, const struct dirent *d, int flags, void *closure);
 
 static bool
@@ -873,6 +917,7 @@ struct fsutil_ftw_ctx {
 	bool			callback_after;
 
 	dev_t			fsdev;
+	struct dev_ino_array	exclude;
 
 	struct fsutil_ftw_level	*current;
 };
@@ -1156,6 +1201,20 @@ fsutil_ftw_next(struct fsutil_ftw_ctx *ctx, struct fsutil_ftw_cursor *cursor)
 				} else {
 					cursor->relative_path = cursor->path;
 				}
+
+				if (ctx->flags & FSUTIL_FTW_NEED_STAT) {
+					if (lstat(cursor->path, &cursor->_st) < 0) {
+						log_error("funny, %s disappeared", cursor->path);
+						continue;
+					}
+					cursor->st = &cursor->_st;
+
+					if (dev_ino_array_contains(&ctx->exclude, cursor->_st.st_dev, cursor->_st.st_ino)) {
+						trace2("%s: skipped", cursor->path);
+						fsutil_ftw_skip(ctx, cursor);
+						continue;
+					}
+				}
 			}
 			return d;
 		}
@@ -1230,6 +1289,19 @@ failed:
 	if (ctx)
 		fsutil_ftw_ctx_free(ctx);
 	return NULL;
+}
+
+bool
+fsutil_ftw_exclude(struct fsutil_ftw_ctx *ctx, const char *path)
+{
+	struct stat stb;
+
+	if (lstat(path, &stb) < 0)
+		return false;
+
+	dev_ino_array_append(&ctx->exclude, stb.st_dev, stb.st_ino);
+	ctx->flags |= FSUTIL_FTW_NEED_STAT;
+	return true;
 }
 
 static int
@@ -1675,4 +1747,20 @@ strutil_array_destroy(struct strutil_array *array)
 		free(array->data);
 
 	memset(array, 0, sizeof(*array));
+}
+
+bool
+strutil_array_contains(const struct strutil_array *array, const char *s)
+{
+	unsigned int i;
+
+	if (s == NULL)
+		return false;
+
+	for (i = 0; i < array->count; ++i) {
+		if (!strcmp(array->data[i], s))
+			return true;
+	}
+
+	return false;
 }
