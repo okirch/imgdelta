@@ -82,6 +82,30 @@ do_stat(const char *path, struct stat *stb)
 	return stb;
 }
 
+static int
+__stat_to_type(const struct stat *st)
+{
+	switch (st->st_mode & S_IFMT) {
+	case S_IFREG:
+		return DT_REG;
+	case S_IFDIR:
+		return DT_DIR;
+	case S_IFLNK:
+		return DT_LNK;
+	case S_IFCHR:
+		return DT_CHR;
+	case S_IFBLK:
+		return DT_BLK;
+	case S_IFSOCK:
+		return DT_SOCK;
+	case S_IFIFO:
+		return DT_FIFO;
+	default:
+		break;
+	}
+	return DT_UNKNOWN;
+}
+
 static inline bool
 __attrs_changed(const char *path, const struct stat *sta, const struct stat *stb)
 {
@@ -216,51 +240,58 @@ failed:
 }
 
 static bool
-image_copy(const char *image_root, struct fsutil_ftw_cursor *cursor, const struct stat *st)
+__image_copy(const char *image_root, const char *src_path, const char *relative_src_path, int dt_type, const struct stat *st)
 {
 	const char *image_path;
-	const struct dirent *d = cursor->d;
 	struct stat _stb;
 
-	trace("copy %s -> %s%s", cursor->path, image_root, cursor->relative_path);
-	if (st == NULL && !(st = do_stat(cursor->path, &_stb)))
+	trace("copy %s -> %s%s", src_path, image_root, relative_src_path);
+	if (st == NULL && !(st = do_stat(src_path, &_stb)))
 		return false;
 
-	image_path = __concat_path(image_root, cursor->relative_path);
-	if (d->d_type == DT_DIR) {
-		trace2("mkdir(%s)", image_path);
+	image_path = __concat_path(image_root, relative_src_path);
+	if (dt_type == DT_DIR) {
+		trace2("create dir %s", image_path);
 		if (mkdir(image_path, st->st_mode) < 0 && errno != EEXIST) {
 			log_error("%s: cannot create directory %m", image_path);
 			return false;
 		}
 	} else
-	if (d->d_type == DT_REG) {
-		if (!copy_file(cursor->path, image_path, st))
+	if (dt_type == DT_REG) {
+		trace2("copy regular file %s", image_path);
+		if (!copy_file(src_path, image_path, st))
 			return false;
 	} else
-	if (d->d_type == DT_LNK) {
+	if (dt_type == DT_LNK) {
 		char target[PATH_MAX + 1];
 		ssize_t len;
 
-		len = readlink(cursor->path, target, sizeof(target) - 1);
+		len = readlink(src_path, target, sizeof(target) - 1);
 		if (len < 0) {
-			log_error("%s: readlink failed: %m", cursor->path);
+			log_error("%s: readlink failed: %m", src_path);
 			return false;
 		}
 		target[len] = '\0';
 
 		(void) unlink(image_path);
-		trace2("%s -> %s", image_path, target);
+		trace2("create symlink %s -> %s", image_path, target);
 		if (symlink(target, image_path) < 0) {
-			log_error("%s: unable to create symlink to: %m", cursor->path, target);
+			log_error("%s: unable to create symlink to: %m", src_path, target);
 			return false;
 		}
 	} else {
-		log_error("dirent type %u not yet implemented", d->d_type);
+		log_error("dirent type %u not yet implemented", dt_type);
 		return false;
 	}
 
 	return __image_update_attrs(image_path, st);
+}
+
+static bool
+image_copy(const char *image_root, struct fsutil_ftw_cursor *cursor, const struct stat *st)
+{
+	assert(cursor);
+	return __image_copy(image_root, cursor->path, cursor->relative_path, cursor->d->d_type, st);
 }
 
 static bool
@@ -351,27 +382,37 @@ update_image_partial(const char *image_root, const char *dir_path)
 	struct fsutil_ftw_cursor image_cursor;
 	bool ok = true;
 
+	/* This is a hack - we need it until fsutil_ftw returns the top-level
+	 * directory as well. */
+	{
+		struct stat stb;
+		int dt_type;
+
+		if (!do_stat(dir_path, &stb))
+			goto failed;
+
+		dt_type = __stat_to_type(&stb);
+		if (!__image_copy(image_root, dir_path, dir_path, dt_type, &stb))
+			goto failed;
+
+		if (!S_ISDIR(stb.st_mode))
+			goto done;
+	}
+
 	system_ctx = fsutil_ftw_open(dir_path, FSUTIL_FTW_SORTED, NULL);
+	if (system_ctx == NULL) {
+		log_error("Cannot open %s", dir_path);
+		return false;
+	}
 
 	memset(&system_cursor, 0, sizeof(system_cursor));
 	memset(&image_cursor, 0, sizeof(image_cursor));
 
-	/* This is a hack - we need it until fsutil_ftw returns the top-level
-	 * directory as well. */
-	{
-		struct fsutil_ftw_cursor root_cursor;
-		struct dirent dirent;
-
-		strcpy(dirent.d_name, dir_path);
-		dirent.d_type = DT_DIR;
-
-		root_cursor.d = &dirent;
-		root_cursor.relative_path = root_cursor.path;
-		strcpy(root_cursor.path, dir_path);
-		ok = image_copy(image_root, &root_cursor, NULL);
-	}
-
 	image_ctx = fsutil_ftw_open(dir_path, FSUTIL_FTW_SORTED, image_root);
+	if (image_ctx == NULL) {
+		log_error("Cannot open %s%s", image_root, dir_path);
+		return false;
+	}
 
 	while (true) {
 		int r;
@@ -413,10 +454,15 @@ update_image_partial(const char *image_root, const char *dir_path)
 		fsutil_ftw_next(image_ctx, &image_cursor);
 	}
 
+done:
 	if (!ok)
 		return 1;
 
 	return 0;
+
+failed:
+	/* FIXME: cleanup */
+	return 1;
 }
 
 static int
