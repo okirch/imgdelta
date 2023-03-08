@@ -1,5 +1,5 @@
 /*
- * wormhole
+ * imgdelta
  *
  *   Copyright (C) 2023 Olaf Kirch <okir@suse.de>
  *
@@ -33,10 +33,18 @@
 #include <getopt.h>
 #include <assert.h>
 
+#include "imgdelta.h"
 #include "tracing.h"
-#include "util.h"
 
-static bool	can_chown = false;
+static bool		can_chown = false;
+static const char *	default_copydirs[] = {
+	"/bin",
+	"/sbin",
+	"/lib",
+	"/lib64",
+	"/usr",
+	NULL,
+};
 
 bool
 __mount_bind(const char *src, const char *dst, int extra_flags)
@@ -412,10 +420,11 @@ update_image_partial(const char *image_root, const char *dir_path)
 }
 
 static int
-update_image_work(const char *image_root, const char *tpath, const char **dirs_to_update, const char *delta_path)
+update_image_work(struct imgdelta_config *cfg, const char *tpath)
 {
 	char upperdir[PATH_MAX], workdir[PATH_MAX], overlay[PATH_MAX];
-	const char *dir_path;
+	const char *image_root = cfg->image_root;
+	unsigned int i;
 
 	snprintf(workdir, sizeof(workdir), "%s/work", tpath);
 	if (mkdir(workdir, 0755) < 0) {
@@ -439,7 +448,8 @@ update_image_work(const char *image_root, const char *tpath, const char **dirs_t
 		return 1;
 
 	trace("=== Building image delta between system and %s ===", image_root);
-	while ((dir_path = *dirs_to_update++) != NULL) {
+	for (i = 0; i < cfg->copydirs.count; ++i) {
+		const char *dir_path = cfg->copydirs.data[i];
 		int rv;
 
 		rv = update_image_partial(image_root, dir_path);
@@ -447,25 +457,22 @@ update_image_work(const char *image_root, const char *tpath, const char **dirs_t
 			return rv;
 	}
 
-	trace("=== Recursively copying image delta to %s ===", delta_path);
-	if (!copy_recursively(upperdir, delta_path))
+	trace("=== Recursively copying image delta to %s ===", cfg->layer_root);
+	if (!copy_recursively(upperdir, cfg->layer_root))
 		return 1;
 
 	return 0;
 }
 
 static int
-update_image(const char *image_root, const char *delta_path)
+update_image(struct imgdelta_config *cfg)
 {
-	static const char *dirs_to_update[] = {
-		"/lib64",
-		NULL
-	};
 	struct fsutil_tempdir tempdir;
 	int rv;
 
 	fsutil_tempdir_init(&tempdir);
 
+	trace("=== Initialiting namespace ===");
 	if (!wormhole_create_user_namespace(true))
 		return 1;
 
@@ -475,13 +482,17 @@ update_image(const char *image_root, const char *delta_path)
 	if (!fsutil_tempdir_mount(&tempdir))
 		return 1;
 
-	rv = update_image_work(image_root, fsutil_tempdir_path(&tempdir), dirs_to_update, delta_path);
+	rv = update_image_work(cfg, fsutil_tempdir_path(&tempdir));
 
 	fsutil_tempdir_cleanup(&tempdir);
 	return rv;
 }
 
 static struct option	long_options[] = {
+	{ "config",	required_argument,	NULL,	'c'		},
+	{ "copy",	required_argument,	NULL,	'C'		},
+	{ "exclude",	required_argument,	NULL,	'X'		},
+	{ "force",	no_argument,		NULL,	'f'		},
 	{ "debug",	no_argument,		NULL,	'd'		},
 
 	{ NULL },
@@ -490,19 +501,29 @@ static struct option	long_options[] = {
 int
 main(int argc, char **argv)
 {
-	unsigned int opt_debug = 0;
-	char *image_root, *delta_path;
-	bool opt_force = false;
+	struct imgdelta_config config = { 0 };
 	int c;
 
-	while ((c = getopt_long(argc, argv, "df", long_options, NULL)) != EOF) {
+	while ((c = getopt_long(argc, argv, "C:X:c:df", long_options, NULL)) != EOF) {
 		switch (c) {
+		case 'c':
+			log_error("Option --config not yet implemented");
+			return 1;
+
+		case 'C':
+			strutil_array_append(&config.copydirs, optarg);
+			break;
+
+		case 'X':
+			strutil_array_append(&config.excldirs, optarg);
+			break;
+
 		case 'd':
-			opt_debug += 1;
+			config.debug += 1;
 			break;
 
 		case 'f':
-			opt_force = true;
+			config.force = true;
 			break;
 
 		default:
@@ -511,31 +532,45 @@ main(int argc, char **argv)
 		}
 	}
 
-	tracing_set_level(opt_debug);
-	trace("tracing set to %u", opt_debug);
+	tracing_set_level(config.debug);
+	trace("tracing set to %u", config.debug);
 
 	if (optind + 2 != argc) {
 		log_error("Expecting two arguments: image-root delta-dir");
 		return 1;
 	}
-	image_root = argv[optind++];
-	delta_path = argv[optind++];
+	config.image_root = pathutil_sanitize(argv[optind++]);
+	config.layer_root = pathutil_sanitize(argv[optind++]);
 
-	if (fsutil_exists(delta_path)) {
-		if (!opt_force) {
-			log_error("%s already exists, timidly bailing out", delta_path);
-			return 1;
-		}
-		if (!fsutil_remove_recursively(delta_path))
-			return 1;
+	if (config.copydirs.count == 0) {
+		const char **dirs = default_copydirs, *path;
+
+		for (dirs = default_copydirs; (path = *dirs++) != NULL; )
+			strutil_array_append(&config.copydirs, path);
 	}
 
-	/* strip off trailing slashes */
-	{
-		int len = strlen(image_root);
+	if (tracing_level > 0) {
+		unsigned int i;
 
-		while (len && image_root[len-1] == '/')
-			image_root[--len] = '\0';
+		trace("=== Configuration ===");
+		trace("Image root:  %s", config.image_root);
+		trace("Layer root:  %s", config.layer_root);
+		trace("Dirs to copy");
+		for (i = 0; i < config.copydirs.count; ++i)
+			trace("  %s", config.copydirs.data[i]);
+		if (config.excldirs.count)
+			trace("Excluded");
+		for (i = 0; i < config.excldirs.count; ++i)
+			trace("  %s", config.excldirs.data[i]);
+	}
+
+	if (fsutil_exists(config.layer_root)) {
+		if (!config.force) {
+			log_error("layer root \"%s\" already exists, timidly bailing out", config.layer_root);
+			return 1;
+		}
+		if (!fsutil_remove_recursively(config.layer_root))
+			return 1;
 	}
 
 	/* should check for CAP_CHOWN */
@@ -543,5 +578,5 @@ main(int argc, char **argv)
 		can_chown = true;
 
 	/* Traverse the entire filesystem and modify the image accordingly. */
-	return update_image(image_root, delta_path);
+	return update_image(&config);
 }
