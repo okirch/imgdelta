@@ -29,7 +29,6 @@ struct imgdelta_config {
 	bool			force;
 	bool			create_base_layer;
 
-	char *			image_root;
 	char *			layer_root;
 
 	struct strutil_array	layers_used;

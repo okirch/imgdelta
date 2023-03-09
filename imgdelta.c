@@ -477,7 +477,6 @@ update_image_work(struct imgdelta_config *cfg, const char *tpath)
 {
 	char upperdir[PATH_MAX], workdir[PATH_MAX], overlay[PATH_MAX];
 	char *lowerspec;
-	const char *image_root = cfg->image_root;
 	unsigned int i;
 	int rv;
 
@@ -511,14 +510,14 @@ update_image_work(struct imgdelta_config *cfg, const char *tpath)
 		return 1;
 	}
 
-	if (!fsutil_mount_overlay(lowerspec, upperdir, workdir, image_root))
+	if (!fsutil_mount_overlay(lowerspec, upperdir, workdir, overlay))
 		return 1;
 
-	trace("=== Building image delta between system and %s ===", image_root);
+	trace("=== Building image delta between system and %s ===", overlay);
 	for (i = 0; i < cfg->copydirs.count; ++i) {
 		const char *dir_path = cfg->copydirs.data[i];
 
-		rv = update_image_partial(image_root, dir_path, &cfg->excldirs);
+		rv = update_image_partial(overlay, dir_path, &cfg->excldirs);
 		if (rv != 0)
 			return rv;
 	}
