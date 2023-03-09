@@ -35,6 +35,7 @@ struct imgdelta_config {
 
 	struct strutil_array	copydirs;
 	struct strutil_array	excldirs;
+	struct strutil_array	makedirs;
 };
 
 #endif /* IMGDELTA_H */

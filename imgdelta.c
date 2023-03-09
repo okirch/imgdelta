@@ -620,6 +620,14 @@ read_config(struct imgdelta_config *cfg, const char *filename)
 			}
 
 			strutil_array_append(&cfg->excldirs, value);
+		} else
+		if (!strcmp(kwd, "makedir")) {
+			if (value[0] != '/') {
+				log_error("%s:%u: argument to makedir must be an absolute path", filename, lineno);
+				goto done;
+			}
+
+			strutil_array_append(&cfg->makedirs, value);
 		} else {
 			log_error("%s:%u: unknown keyword \"%s\"", filename, lineno, kwd);
 			goto done;
