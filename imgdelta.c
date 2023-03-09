@@ -115,19 +115,22 @@ __attrs_changed(const char *path, const struct stat *sta, const struct stat *stb
 		trace("%s: mode changed 0%o -> 0%o", path, sta->st_mode, stb->st_mode);
 		changed = true;
 	}
-	if (!S_ISDIR(stb->st_mode) && sta->st_size != stb->st_size) {
-		trace("%s: size changed %lu -> %lu", path, (long) sta->st_size, (long) stb->st_size);
-		changed = true;
-	}
 
-	if (sta->st_mtim.tv_sec != stb->st_mtim.tv_sec
-	 || sta->st_mtim.tv_nsec / 1000 != stb->st_mtim.tv_nsec / 1000) {
-		trace("%s: mtime changed %lu.%09lu -> %lu.%09lu", path,
-				(long) sta->st_mtim.tv_sec,
-				(long) sta->st_mtim.tv_nsec,
-				(long) stb->st_mtim.tv_sec,
-				(long) stb->st_mtim.tv_nsec);
-		changed = true;
+	if (!S_ISDIR(stb->st_mode)) {
+		if (sta->st_size != stb->st_size) {
+			trace("%s: size changed %lu -> %lu", path, (long) sta->st_size, (long) stb->st_size);
+			changed = true;
+		}
+
+		if (sta->st_mtim.tv_sec != stb->st_mtim.tv_sec
+		 || sta->st_mtim.tv_nsec / 1000 != stb->st_mtim.tv_nsec / 1000) {
+			trace("%s: mtime changed %lu.%09lu -> %lu.%09lu", path,
+					(long) sta->st_mtim.tv_sec,
+					(long) sta->st_mtim.tv_nsec,
+					(long) stb->st_mtim.tv_sec,
+					(long) stb->st_mtim.tv_nsec);
+			changed = true;
+		}
 	}
 
 	if (can_chown
