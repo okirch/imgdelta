@@ -377,8 +377,9 @@ copy_recursively(const char *src_path, const char *dst_path)
 }
 
 static int
-update_image_partial(const char *image_root, const char *dir_path, const struct strutil_array *exclude)
+update_image_partial(struct imgdelta_config *cfg, const char *image_root, const char *dir_path)
 {
+	const struct strutil_array *exclude = &cfg->excldirs;
 	struct fsutil_ftw_ctx *system_ctx;
 	struct fsutil_ftw_ctx *image_ctx;
 	struct fsutil_ftw_cursor system_cursor;
@@ -524,7 +525,7 @@ update_image_work(struct imgdelta_config *cfg, const char *tpath)
 	for (i = 0; i < cfg->copydirs.count; ++i) {
 		const char *dir_path = cfg->copydirs.data[i];
 
-		rv = update_image_partial(overlay, dir_path, &cfg->excldirs);
+		rv = update_image_partial(cfg, overlay, dir_path);
 		if (rv != 0)
 			return rv;
 	}
