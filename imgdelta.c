@@ -490,6 +490,10 @@ update_image_work(struct imgdelta_config *cfg, const char *tpath)
 		assert(cfg->layers_used.count == 0);
 
 		snprintf(empty, sizeof(empty), "%s/empty", tpath);
+		if (mkdir(empty, 0755) < 0) {
+			log_error("canot create empty directory: %m");
+			return 1;
+		}
 		strutil_array_append(&cfg->layers_used, empty);
 	}
 
