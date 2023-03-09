@@ -579,11 +579,69 @@ static struct option	long_options[] = {
 	{ NULL },
 };
 
+static bool
+read_config(struct imgdelta_config *cfg, const char *filename)
+{
+	char buffer[256];
+	int lineno = 0;
+	FILE *fp = NULL;
+	bool ok = false;
+
+	trace("Reading config file %s", filename);
+	if (!(fp = fopen(filename, "r"))) {
+		log_error("%s: %m", filename);
+		goto done;
+	}
+
+	while (fgets(buffer, sizeof(buffer), fp) != NULL) {
+		char *kwd, *value;
+
+		buffer[strcspn(buffer, "\r\n")] = '\0';
+		lineno ++;
+
+		if (buffer[0] == '#' || !(kwd = strtok(buffer, " \t")))
+			continue;
+
+		if (!(value = strtok(NULL, "")))
+			value = "";
+
+		if (!strcmp(kwd, "copy")) {
+			if (value[0] != '/') {
+				log_error("%s:%u: argument to copy must be an absolute path", filename, lineno);
+				goto done;
+			}
+
+			strutil_array_append(&cfg->copydirs, value);
+		} else
+		if (!strcmp(kwd, "exclude")) {
+			if (value[0] != '/') {
+				log_error("%s:%u: argument to exclude must be an absolute path", filename, lineno);
+				goto done;
+			}
+
+			strutil_array_append(&cfg->excldirs, value);
+		} else {
+			log_error("%s:%u: unknown keyword \"%s\"", filename, lineno, kwd);
+			goto done;
+		}
+	}
+
+	ok = true;
+
+done:
+	if (fp)
+		fclose(fp);
+	return ok;
+}
+
 int
 main(int argc, char **argv)
 {
 	struct imgdelta_config config = { 0 };
 	int c;
+
+	if (fsutil_exists("/etc/imgdelta.conf") && !read_config(&config, "/etc/imgdelta.conf"))
+		return 1;
 
 	while ((c = getopt_long(argc, argv, "BC:L:X:c:df", long_options, NULL)) != EOF) {
 		switch (c) {
@@ -592,8 +650,9 @@ main(int argc, char **argv)
 			break;
 
 		case 'c':
-			log_error("Option --config not yet implemented");
-			return 1;
+			if (!read_config(&config, optarg))
+				return 1;
+			break;
 
 		case 'C':
 			strutil_array_append(&config.copydirs, optarg);
